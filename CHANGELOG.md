@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - **Breaking:** `AnalyticsMiddleware` no longer trusts `X-Client-Id`, the leftmost `X-Forwarded-For` hop or `X-Real-IP`. The client is identified by `HttpRequest::client_address(trusted_proxy_depth)` (socket peer at the default depth `0`), or by a header only when explicitly configured with `AnalyticsConfig::client_id_header`. Migration: set `trusted_proxy_depth` to your proxy count, and `client_id_header` only for a header your gateway sets and strips from client input.
