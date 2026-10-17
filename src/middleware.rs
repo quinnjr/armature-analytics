@@ -1,8 +1,9 @@
 //! Analytics middleware for automatic request tracking
 
-use crate::{Analytics, ErrorRecord, RequestRecord};
+use crate::{Analytics, AnalyticsConfig, ErrorRecord, RequestRecord};
 use armature_core::{Error, HttpRequest, HttpResponse, Middleware, Next};
 use async_trait::async_trait;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
 /// Middleware that automatically records analytics for all requests
@@ -82,27 +83,77 @@ impl AnalyticsContext {
     }
 }
 
-/// Extract a client identifier from a request for per-client tracking.
+/// Anonymize a client address: IPv4 is truncated to its `/24` network and
+/// IPv6 to its `/48`, so the recorded value identifies a network rather than a
+/// person.
 ///
-/// Prefers, in order, the `x-client-id`, `x-forwarded-for` (first hop) and
-/// `x-real-ip` headers. Returns `None` when no identifying header is present.
-fn extract_client_id(req: &HttpRequest) -> Option<String> {
-    if let Some(id) = req.headers.get("x-client-id") {
-        return Some(id.to_owned());
-    }
-    if let Some(fwd) = req.headers.get("x-forwarded-for") {
-        // The first entry is the originating client.
-        if let Some(first) = fwd.split(',').next() {
-            let trimmed = first.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+/// # Examples
+///
+/// ```
+/// use armature_analytics::anonymize_ip;
+///
+/// assert_eq!(anonymize_ip("203.0.113.77".parse().unwrap()), "203.0.113.0/24");
+/// assert_eq!(anonymize_ip("2001:db8:abcd:12::1".parse().unwrap()), "2001:db8:abcd::/48");
+/// ```
+pub fn anonymize_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            format!("{}/24", Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            // An IPv4-mapped address is an IPv4 client; truncate it as one.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return anonymize_ip(IpAddr::V4(v4));
             }
+            let s = v6.segments();
+            format!("{}/48", Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0))
         }
     }
-    if let Some(ip) = req.headers.get("x-real-ip") {
-        return Some(ip.to_owned());
+}
+
+/// Anonymize a client identifier if it is an IP address; other identifiers
+/// are returned unchanged.
+pub fn anonymize_client_id(client_id: &str) -> String {
+    match client_id.trim().parse::<IpAddr>() {
+        Ok(ip) => anonymize_ip(ip),
+        Err(_) => client_id.to_string(),
     }
-    None
+}
+
+/// Extract a client identifier from a request for per-client tracking.
+///
+/// 1. The configured [`AnalyticsConfig::client_id_header`], if any — never a
+///    hard-coded header the end client could set.
+/// 2. Otherwise the client address from
+///    [`HttpRequest::client_address`] at the configured
+///    [`AnalyticsConfig::trusted_proxy_depth`] (socket peer at depth `0`),
+///    anonymized unless [`AnalyticsConfig::anonymize_client_ips`] is off.
+///
+/// Returns `None` when nothing trustworthy is available.
+fn extract_client_id(req: &HttpRequest, config: &AnalyticsConfig) -> Option<String> {
+    if let Some(header) = &config.client_id_header {
+        return req
+            .headers
+            .get(header)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+    }
+    let ip = req.client_address(config.trusted_proxy_depth)?;
+    Some(if config.anonymize_client_ips {
+        anonymize_ip(ip)
+    } else {
+        ip.to_string()
+    })
+}
+
+/// Sorted, de-duplicated query parameter names — never values.
+fn query_keys(req: &HttpRequest) -> Vec<String> {
+    let mut keys: Vec<String> = req.query().iter().map(|(k, _)| k.to_string()).collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 #[async_trait]
@@ -135,15 +186,12 @@ impl Middleware for AnalyticsMiddleware {
         // Optionally fold query parameters into the tracked path.
         let mut tracked_path = normalize_path(req.path_only());
         if config.include_query_params && !req.query().is_empty() {
-            let mut pairs: Vec<(&str, &str)> = req.query().iter().collect();
-            pairs.sort_by(|a, b| a.0.cmp(b.0));
-            let query: Vec<String> = pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-            tracked_path = format!("{}?{}", tracked_path, query.join("&"));
+            tracked_path = format!("{}?{}", tracked_path, query_keys(&req).join("&"));
         }
 
         // Capture the client id only when client tracking is enabled.
         let client_id = if config.track_clients {
-            extract_client_id(&req)
+            extract_client_id(&req, config)
         } else {
             None
         };
@@ -392,6 +440,91 @@ mod tests {
 
         let snapshot = analytics.snapshot();
         assert_eq!(snapshot.endpoints.len(), 1);
-        assert_eq!(snapshot.endpoints[0].path, "/users/:id?a=1&b=2");
+        assert_eq!(snapshot.endpoints[0].path, "/users/:id?a&b");
+    }
+
+    // Query values carry tokens and personal data: only names are tracked,
+    // even under the verbose development preset.
+    #[tokio::test]
+    async fn test_development_preset_records_query_keys_only() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let analytics = Analytics::new(AnalyticsConfig::development());
+        let mw = AnalyticsMiddleware::new(analytics.clone());
+        let req = HttpRequest::new("GET", "/reset?token=s3cr3t&email=a@b.c".to_string());
+        let next: Next = Box::new(|_req: HttpRequest| {
+            Box::pin(async { Ok(HttpResponse::ok()) })
+                as Pin<Box<dyn Future<Output = Result<HttpResponse, Error>> + Send>>
+        });
+        mw.handle(req, next).await.unwrap();
+
+        let snapshot = analytics.snapshot();
+        assert_eq!(snapshot.endpoints[0].path, "/reset?email&token");
+    }
+
+    fn peer_request() -> HttpRequest {
+        HttpRequest::new("GET", "/".to_string())
+            .with_peer(Some(std::net::SocketAddr::from(([198, 51, 100, 23], 4000))))
+    }
+
+    #[test]
+    fn test_client_id_ignores_spoofable_headers_by_default() {
+        let config = AnalyticsConfig::default();
+        let mut req = peer_request();
+        req.headers.insert("x-client-id", "victim");
+        req.headers.insert("x-forwarded-for", "1.2.3.4");
+        req.headers.insert("x-real-ip", "5.6.7.8");
+        assert_eq!(
+            extract_client_id(&req, &config),
+            Some("198.51.100.0/24".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_id_uses_rightmost_trusted_hop() {
+        let config = AnalyticsConfig::builder().trusted_proxy_depth(1).build();
+        let mut req = peer_request();
+        req.headers
+            .insert("x-forwarded-for", "1.2.3.4, 203.0.113.9");
+        assert_eq!(
+            extract_client_id(&req, &config),
+            Some("203.0.113.0/24".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_id_header_only_when_configured() {
+        let config = AnalyticsConfig::builder()
+            .client_id_header("x-gateway-client")
+            .build();
+        let mut req = peer_request();
+        req.headers.insert("x-gateway-client", "tenant-42");
+        assert_eq!(
+            extract_client_id(&req, &config),
+            Some("tenant-42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_ip_anonymization() {
+        assert_eq!(anonymize_ip("10.1.2.3".parse().unwrap()), "10.1.2.0/24");
+        assert_eq!(
+            anonymize_ip("2001:db8:1:2:3:4:5:6".parse().unwrap()),
+            "2001:db8:1::/48"
+        );
+        assert_eq!(
+            anonymize_ip("::ffff:10.1.2.3".parse().unwrap()),
+            "10.1.2.0/24"
+        );
+        assert_eq!(anonymize_client_id("user-7"), "user-7");
+
+        let config = AnalyticsConfig::builder()
+            .anonymize_client_ips(false)
+            .build();
+        assert_eq!(
+            extract_client_id(&peer_request(), &config),
+            Some("198.51.100.23".to_string())
+        );
     }
 }

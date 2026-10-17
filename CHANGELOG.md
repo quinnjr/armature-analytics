@@ -9,6 +9,18 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
+### Security
+
+- **Breaking:** `AnalyticsMiddleware` no longer trusts `X-Client-Id`, the leftmost `X-Forwarded-For` hop or `X-Real-IP`. The client is identified by `HttpRequest::client_address(trusted_proxy_depth)` (socket peer at the default depth `0`), or by a header only when explicitly configured with `AnalyticsConfig::client_id_header`. Migration: set `trusted_proxy_depth` to your proxy count, and `client_id_header` only for a header your gateway sets and strips from client input.
+- Client addresses are anonymized by default (IPv4 `/24`, IPv6 `/48`), both for request records and for IP-shaped client ids of rate-limit events (`anonymize_client_ips`, default `true`).
+- **Breaking:** `include_query_params` (also on in the `development()` preset) now appends query parameter **names** only (`/search?page&q`); values are never recorded.
+
+### Added
+
+- `AnalyticsConfig::{trusted_proxy_depth, client_id_header, anonymize_client_ips}` with matching builder methods (all `#[serde(default)]`), and the `anonymize_ip` / `anonymize_client_id` helpers.
+
 ## [0.4.0] - 2026-09-15
 
 ### Changed
