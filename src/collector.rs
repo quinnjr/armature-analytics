@@ -68,6 +68,8 @@ pub struct MetricsCollector {
     enable_endpoint_metrics: bool,
     enable_rate_limit_tracking: bool,
     throughput_window_secs: u64,
+    /// Truncate IP-shaped client ids of rate-limit events before storing them.
+    anonymize_client_ips: bool,
 }
 
 struct EndpointData {
@@ -138,6 +140,7 @@ impl MetricsCollector {
             enable_endpoint_metrics: true,
             enable_rate_limit_tracking: true,
             throughput_window_secs: 60,
+            anonymize_client_ips: true,
         }
     }
 
@@ -153,6 +156,7 @@ impl MetricsCollector {
         collector.enable_endpoint_metrics = config.enable_endpoint_metrics;
         collector.enable_rate_limit_tracking = config.enable_rate_limit_tracking;
         collector.throughput_window_secs = config.throughput_window_secs.max(1);
+        collector.anonymize_client_ips = config.anonymize_client_ips;
         collector
     }
 
@@ -333,19 +337,27 @@ impl MetricsCollector {
             RateLimitEventType::Limited => {
                 self.rate_limit_limited.fetch_add(1, Ordering::Relaxed);
 
+                // A rate limiter commonly keys on the client address; never
+                // retain a full address when anonymization is on.
+                let client_id = if self.anonymize_client_ips {
+                    crate::anonymize_client_id(&event.client_id)
+                } else {
+                    event.client_id
+                };
+
                 // Track limited client. The cap gates insertion of *new*
                 // clients only; an already-tracked client must keep counting.
-                let tracked = self.rate_limited_clients.contains_key(&event.client_id)
+                let tracked = self.rate_limited_clients.contains_key(&client_id)
                     || self.rate_limited_clients.len() < self.max_rate_limit_clients;
                 if tracked {
                     self.rate_limited_clients
-                        .entry(event.client_id.clone())
+                        .entry(client_id.clone())
                         .and_modify(|info| {
                             info.times_limited += 1;
                             info.last_limited = Utc::now();
                         })
                         .or_insert_with(|| ClientRateLimitInfo {
-                            client_id: event.client_id,
+                            client_id,
                             times_limited: 1,
                             last_limited: Utc::now(),
                         });
@@ -766,6 +778,14 @@ mod tests {
             a.requests, 2,
             "existing endpoint must keep incrementing at cap"
         );
+    }
+
+    #[test]
+    fn test_rate_limited_client_ips_are_anonymized() {
+        let collector = MetricsCollector::from_config(&crate::AnalyticsConfig::default());
+        collector.record_rate_limit(RateLimitEvent::limited("203.0.113.77", 10, 10, 60));
+        let metrics = collector.rate_limit_metrics();
+        assert_eq!(metrics.top_limited_clients[0].client_id, "203.0.113.0/24");
     }
 
     // Regression: same freeze bug for the rate-limited client map.

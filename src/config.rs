@@ -21,14 +21,44 @@ pub struct AnalyticsConfig {
     pub enable_rate_limit_tracking: bool,
     /// Paths to exclude from analytics
     pub exclude_paths: Vec<String>,
-    /// Whether to include query parameters in path tracking
+    /// Whether to include query parameter **names** in path tracking.
+    ///
+    /// Only the sorted, de-duplicated parameter names are appended
+    /// (`/search?page&q`); values are never recorded, since they routinely
+    /// carry tokens, reset codes, e-mail addresses and search terms.
     pub include_query_params: bool,
     /// Sampling rate (0.0 to 1.0, 1.0 = 100% of requests)
     pub sampling_rate: f64,
     /// Enable client identification tracking
     pub track_clients: bool,
+    /// Number of reverse proxies in front of the app trusted to have appended
+    /// to `X-Forwarded-For`.
+    ///
+    /// Default `0`: forwarding headers are ignored and the socket peer is the
+    /// client address. Resolved by
+    /// [`HttpRequest::client_address`](armature_core::HttpRequest::client_address),
+    /// which counts from the *right* so a client cannot choose its own address.
+    #[serde(default)]
+    pub trusted_proxy_depth: usize,
+    /// Request header carrying a client identifier set by **trusted**
+    /// infrastructure (e.g. an API gateway that authenticates the caller and
+    /// strips any client-supplied copy).
+    ///
+    /// Default `None`: no header is trusted and the (anonymized) client
+    /// address is used. Only configure this when the header cannot be supplied
+    /// by the end client.
+    #[serde(default)]
+    pub client_id_header: Option<String>,
+    /// Anonymize client addresses before recording them: IPv4 is truncated to
+    /// its `/24` and IPv6 to its `/48` network. Default `true`.
+    #[serde(default = "default_true")]
+    pub anonymize_client_ips: bool,
     /// Maximum number of unique clients to track for rate limits
     pub max_rate_limit_clients: usize,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AnalyticsConfig {
@@ -50,6 +80,9 @@ impl Default for AnalyticsConfig {
             include_query_params: false,
             sampling_rate: 1.0,
             track_clients: true,
+            trusted_proxy_depth: 0,
+            client_id_header: None,
+            anonymize_client_ips: true,
             max_rate_limit_clients: 1000,
         }
     }
@@ -75,6 +108,9 @@ impl AnalyticsConfig {
             include_query_params: true,
             sampling_rate: 1.0,
             track_clients: true,
+            trusted_proxy_depth: 0,
+            client_id_header: None,
+            anonymize_client_ips: true,
             max_rate_limit_clients: 5000,
         }
     }
@@ -99,6 +135,9 @@ impl AnalyticsConfig {
             include_query_params: false,
             sampling_rate: 1.0,
             track_clients: true,
+            trusted_proxy_depth: 0,
+            client_id_header: None,
+            anonymize_client_ips: true,
             max_rate_limit_clients: 1000,
         }
     }
@@ -122,6 +161,9 @@ impl AnalyticsConfig {
             include_query_params: false,
             sampling_rate: 0.1, // 10% sampling
             track_clients: false,
+            trusted_proxy_depth: 0,
+            client_id_header: None,
+            anonymize_client_ips: true,
             max_rate_limit_clients: 100,
         }
     }
@@ -257,6 +299,27 @@ impl AnalyticsConfigBuilder {
         self
     }
 
+    /// Set how many reverse proxies are trusted to have appended to
+    /// `X-Forwarded-For`. See [`AnalyticsConfig::trusted_proxy_depth`].
+    pub fn trusted_proxy_depth(mut self, depth: usize) -> Self {
+        self.config.trusted_proxy_depth = depth;
+        self
+    }
+
+    /// Trust a client-identifier header set by your own infrastructure. See
+    /// [`AnalyticsConfig::client_id_header`].
+    pub fn client_id_header(mut self, header: impl Into<String>) -> Self {
+        self.config.client_id_header = Some(header.into());
+        self
+    }
+
+    /// Enable or disable client-address anonymization. See
+    /// [`AnalyticsConfig::anonymize_client_ips`].
+    pub fn anonymize_client_ips(mut self, anonymize: bool) -> Self {
+        self.config.anonymize_client_ips = anonymize;
+        self
+    }
+
     pub fn max_rate_limit_clients(mut self, max: usize) -> Self {
         self.config.max_rate_limit_clients = max;
         self
@@ -276,6 +339,20 @@ mod tests {
         let config = AnalyticsConfig::default();
         assert!(config.enabled);
         assert_eq!(config.sampling_rate, 1.0);
+    }
+
+    #[test]
+    fn test_presets_do_not_trust_client_headers() {
+        for config in [
+            AnalyticsConfig::default(),
+            AnalyticsConfig::development(),
+            AnalyticsConfig::production(),
+            AnalyticsConfig::minimal(),
+        ] {
+            assert_eq!(config.trusted_proxy_depth, 0);
+            assert!(config.client_id_header.is_none());
+            assert!(config.anonymize_client_ips);
+        }
     }
 
     #[test]
