@@ -12,7 +12,7 @@ keywords = ["analytics", "metrics", "monitoring", "api", "observability"]
 categories = ["web-programming", "development-tools::profiling"]
 
 [dependencies]
-armature-core = { version = "0.12" }
+armature-core = { version = "0.13" }
 armature-log = { version = "0.3" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
